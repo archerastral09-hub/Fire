@@ -41,7 +41,7 @@ URL_LIMIT = int(os.getenv("URL_LIMIT", "500"))               # URLs max par site
 SITEMAP = os.getenv("SITEMAP", "include")                    # include | skip | only
 INCLUDE_SUBDOMAINS = os.getenv("INCLUDE_SUBDOMAINS", "false").lower() == "true"
 MAP_FROM_ORIGIN = os.getenv("MAP_FROM_ORIGIN", "true").lower() == "true"  # mappe la racine du site
-COUNTRY = os.getenv("LOCATION_COUNTRY", "FR")
+COUNTRY = os.getenv("LOCATION_COUNTRY", "")                  # vide = pas de paramètre location (comme le playground)
 LANGUAGES = [x for x in os.getenv("LOCATION_LANGUAGES", "fr").split(",") if x]
 # Limite /map par clé (req/min) : Free=10, Hobby=100, Standard=500, Growth=5000, Scale=10000.
 # Défaut prudent = Free. On garde ~10 % de marge.
@@ -151,8 +151,9 @@ def firecrawl_call(key: str, url: str) -> tuple[int, str, str | None]:
     payload = {
         "url": url, "limit": URL_LIMIT, "sitemap": SITEMAP,
         "includeSubdomains": INCLUDE_SUBDOMAINS,
-        "location": {"country": COUNTRY, "languages": LANGUAGES},
     }
+    if COUNTRY:  # n'envoyer location que si demandé : il peut renvoyer des résultats vides
+        payload["location"] = {"country": COUNTRY, "languages": LANGUAGES}
     req = urllib.request.Request(
         FIRECRAWL_URL, data=json.dumps(payload).encode(), method="POST",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -317,7 +318,7 @@ def cmd_map(args) -> int:
     log("=" * 70)
     log(f"Config : url={FIRECRAWL_URL} limit={URL_LIMIT} sitemap={SITEMAP} "
         f"subdomains={INCLUDE_SUBDOMAINS} origin={MAP_FROM_ORIGIN} "
-        f"location={COUNTRY}/{LANGUAGES}")
+        f"location={(COUNTRY + '/' + str(LANGUAGES)) if COUNTRY else '(non envoyé)'}")
     log(f"         timeout={REQUEST_TIMEOUT_S}s essais={MAX_ATTEMPTS} "
         f"retry_empty={RETRY_EMPTY} verbose={VERBOSE} runtime_max={MAX_RUNTIME_MIN:g} min")
     pool = KeyPool(load_keys())
@@ -448,33 +449,4 @@ def cmd_build(args) -> int:
     stats = Counter()
     for r in recs:
         ss.append([r["domaine"], r.get("title"), r.get("cid"), r["url_mappee"],
-                   r["statut"], len(r.get("links", [])), r.get("erreur") or r.get("reponse_brute")])
-        stats[r["statut"]] += 1
-    sy = wb.create_sheet("Synthèse")
-    sy.append(["Indicateur", "Valeur"])
-    sy.append(["Sites traités", len(recs)])
-    for k, v in sorted(stats.items()):
-        sy.append([f"  statut {k}", v])
-    sy.append(["URLs récupérées", n_urls])
-    wb.save(OUT_DIR / "urls.xlsx")
-    log(f"✅ {len(recs)} sites, {n_urls} URLs -> {OUT_DIR / 'urls.csv'} et {OUT_DIR / 'urls.xlsx'}")
-    log(f"   {dict(stats)}")
-    return 0
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    m = sub.add_parser("map", help="appelle Firecrawl /map (reprend où il s'est arrêté)")
-    m.add_argument("--input", default="data/sites.xlsx")
-    m.add_argument("--limit", type=int, default=0, help="nb max de sites (0 = tous)")
-    m.add_argument("--workers", type=int, default=WORKERS)
-    m.set_defaults(func=cmd_map)
-    b = sub.add_parser("build", help="génère urls.csv / urls.xlsx")
-    b.set_defaults(func=cmd_build)
-    args = ap.parse_args()
-    return args.func(args)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+                   r["statut"], len(r.get("links", [])), r.get("erreur") or
