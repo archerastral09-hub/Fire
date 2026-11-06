@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""
+Firecrawl /map en masse : récupère la liste des URLs de chaque site web,
+avec rotation de plusieurs clés API et reprise automatique.
+
+    python map_sites.py map     # appelle Firecrawl, écrit output/raw_map.jsonl
+    python map_sites.py build   # -> output/urls.csv + output/urls.xlsx (+ résumé par site)
+
+Clés : FIRECRAWL_API_KEYS (séparées par virgule, point-virgule ou retour à la ligne).
+Entrée : data/sites.xlsx (ou .csv) avec une colonne `website` (+ `title`, `cid` facultatives).
+
+Variables utiles pour le diagnostic :
+    VERBOSE=true        une ligne de log par site + détail des tentatives (défaut : true)
+    RETRY_EMPTY=true    retente les sites déjà traités avec "aucun_resultat" (défaut : true)
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import urlparse
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
+
+# --------------------------------------------------------------------------- #
+# Configuration (surchargeable par variables d'environnement)
+# --------------------------------------------------------------------------- #
+FIRECRAWL_URL = os.getenv("FIRECRAWL_URL", "https://api.firecrawl.dev/v2/map")
+URL_LIMIT = int(os.getenv("URL_LIMIT", "500"))               # URLs max par site (max API : 100000)
+SITEMAP = os.getenv("SITEMAP", "include")                    # include | skip | only
+INCLUDE_SUBDOMAINS = os.getenv("INCLUDE_SUBDOMAINS", "false").lower() == "true"
+MAP_FROM_ORIGIN = os.getenv("MAP_FROM_ORIGIN", "true").lower() == "true"  # mappe la racine du site
+COUNTRY = os.getenv("LOCATION_COUNTRY", "FR")
+LANGUAGES = [x for x in os.getenv("LOCATION_LANGUAGES", "fr").split(",") if x]
+# Limite /map par clé (req/min) : Free=10, Hobby=100, Standard=500, Growth=5000, Scale=10000.
+# Défaut prudent = Free. On garde ~10 % de marge.
+RPM_PER_KEY = float(os.getenv("RPM_PER_KEY", "10"))
+WORKERS = int(os.getenv("WORKERS", "5"))
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "6"))
+KEY_COOLDOWN_S = int(os.getenv("KEY_COOLDOWN_S", "30"))      # pause d'une clé après un 429
+REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "120"))
+MAX_RUNTIME_MIN = float(os.getenv("MAX_RUNTIME_MIN", "340"))  # < limite 6 h de GitHub
+VERBOSE = os.getenv("VERBOSE", "true").lower() == "true"
+RETRY_EMPTY = os.getenv("RETRY_EMPTY", "true").lower() == "true"
+
+OUT_DIR = Path(os.getenv("OUT_DIR", "output"))
+RAW_FILE = OUT_DIR / "raw_map.jsonl"
+XLSX_ROW_CAP = 1_000_000
+
+# Noms de colonne acceptés pour l'URL du site (comparés en minuscules, sans espaces autour)
+WEBSITE_COLUMNS = ["website", "site", "site web", "site_web", "siteweb", "site internet",
+                   "url", "web", "domaine", "domain"]
+
+_print_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    with _print_lock:
+        print(msg, flush=True)
+
+
+def vlog(msg: str) -> None:
+    if VERBOSE:
+        log(msg)
+
+
+# --------------------------------------------------------------------------- #
+# Rotation des clés
+# --------------------------------------------------------------------------- #
+class AllKeysExhausted(Exception):
+    pass
+
+
+class KeyPool:
+    """Round-robin thread-safe. 429 -> clé en pause ; 401/402 -> clé retirée."""
+
+    def __init__(self, keys: list[str]):
+        if not keys:
+            raise SystemExit("❌ Aucune clé API : définir le secret FIRECRAWL_API_KEYS "
+                             "(Settings > Secrets and variables > Actions).")
+        self.keys = keys
+        self.lock = threading.Lock()
+        self.i = 0
+        self.dead: set[int] = set()
+        self.cool_until: dict[int, float] = {}
+        self.used: Counter = Counter()
+        self.next_slot: dict[int, float] = {}  # prochain instant autorisé par clé
+        self.interval = 60.0 / max(RPM_PER_KEY * 0.9, 0.1)
+
+    def acquire(self) -> tuple[int, str]:
+        while True:
+            with self.lock:
+                alive = [k for k in range(len(self.keys)) if k not in self.dead]
+                if not alive:
+                    raise AllKeysExhausted()
+                now = time.time()
+                n = len(self.keys)
+                for _ in range(n):
+                    idx = self.i % n
+                    self.i += 1
+                    if idx in self.dead or self.cool_until.get(idx, 0) > now \
+                            or self.next_slot.get(idx, 0) > now:
+                        continue
+                    self.next_slot[idx] = now + self.interval  # réserve le créneau (limiteur)
+                    self.used[idx] += 1
+                    return idx, self.keys[idx]
+                wait = min(max(self.cool_until.get(k, 0), self.next_slot.get(k, 0))
+                           for k in alive) - now
+            time.sleep(max(0.2, min(wait, 5)))
+
+    def cooldown(self, idx: int, seconds: float) -> None:
+        with self.lock:
+            self.cool_until[idx] = max(self.cool_until.get(idx, 0), time.time() + seconds)
+        vlog(f"  ⏸️  Clé #{idx + 1} en pause {seconds:.0f}s (429)")
+
+    def kill(self, idx: int, reason: str) -> None:
+        with self.lock:
+            if idx not in self.dead:
+                self.dead.add(idx)
+                log(f"⚠️  Clé #{idx + 1} retirée ({reason}). "
+                    f"Restantes : {len(self.keys) - len(self.dead)}/{len(self.keys)}")
+
+    def summary(self) -> str:
+        return ", ".join(
+            f"#{i + 1}: {self.used[i]} req{' (épuisée)' if i in self.dead else ''}"
+            for i in range(len(self.keys))
+        )
+
+
+def load_keys() -> list[str]:
+    raw = os.getenv("FIRECRAWL_API_KEYS") or os.getenv("FIRECRAWL_API_KEY") or ""
+    keys = [k.strip() for k in re.split(r"[,;\s]+", raw) if k.strip()]
+    return list(dict.fromkeys(keys))
+
+
+# --------------------------------------------------------------------------- #
+# Appel Firecrawl /v2/map
+# --------------------------------------------------------------------------- #
+def firecrawl_call(key: str, url: str) -> tuple[int, str, str | None]:
+    payload = {
+        "url": url, "limit": URL_LIMIT, "sitemap": SITEMAP,
+        "includeSubdomains": INCLUDE_SUBDOMAINS,
+        "location": {"country": COUNTRY, "languages": LANGUAGES},
+    }
+    req = urllib.request.Request(
+        FIRECRAWL_URL, data=json.dumps(payload).encode(), method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as r:
+            return r.status, r.read().decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace"), e.headers.get("Retry-After")
+
+
+def map_site(pool: KeyPool, url: str, stop: threading.Event) -> dict:
+    last_err = "erreur_inconnue"
+    for attempt in range(MAX_ATTEMPTS):
+        if stop.is_set():
+            return {"statut": "interrompu", "links": []}
+        idx, key = pool.acquire()  # peut lever AllKeysExhausted
+        tag = f"{url} (clé #{idx + 1}, essai {attempt + 1}/{MAX_ATTEMPTS})"
+        try:
+            code, text, retry_after = firecrawl_call(key, url)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_err = f"erreur_reseau: {e}"
+            vlog(f"  ↻ {tag} -> {last_err}")
+            time.sleep(min(2 ** attempt, 20))
+            continue
+
+        if code == 200:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                last_err = "erreur_json"
+                vlog(f"  ↻ {tag} -> HTTP 200 mais JSON invalide : {text[:200]!r}")
+                continue
+            if data.get("success") is False:
+                err = str(data.get("error"))[:200]
+                log(f"  ❌ {tag} -> success=false : {err}")
+                return {"statut": "erreur_api", "links": [], "erreur": err}
+            links = []
+            for l in data.get("links", []) or []:
+                if isinstance(l, str):
+                    links.append({"url": l})
+                elif isinstance(l, dict) and l.get("url"):
+                    links.append({"url": l["url"], "title": l.get("title"),
+                                  "description": l.get("description")})
+            if not links:
+                # On garde un extrait de la réponse brute pour comprendre pourquoi c'est vide
+                log(f"  ⚠️  {tag} -> HTTP 200 mais 0 lien. "
+                    f"Clés de la réponse : {list(data.keys())}. Extrait : {text[:300]!r}")
+                return {"statut": "aucun_resultat", "links": [], "reponse_brute": text[:300]}
+            return {"statut": "ok", "links": links}
+        if code == 429:
+            m = re.search(r"retry after (\d+)", text, re.I)
+            if retry_after and retry_after.isdigit():
+                wait = int(retry_after) + 1
+            elif m:
+                wait = int(m.group(1)) + 1
+            else:
+                wait = KEY_COOLDOWN_S
+            pool.cooldown(idx, min(wait, 3600))
+            last_err = "erreur_http_429"
+            vlog(f"  ↻ {tag} -> 429, attente {wait}s : {text[:120]!r}")
+            continue
+        if code in (401, 402):  # clé invalide / crédits épuisés
+            pool.kill(idx, f"HTTP {code}: {text[:80]!r}")
+            last_err = f"erreur_http_{code}"
+            continue
+        if code >= 500 or code == 408:
+            last_err = f"erreur_http_{code}"
+            vlog(f"  ↻ {tag} -> HTTP {code} : {text[:120]!r}")
+            time.sleep(min(2 ** attempt, 20))
+            continue
+        log(f"  ❌ {tag} -> HTTP {code} : {text[:200]!r}")
+        return {"statut": f"erreur_http_{code}", "links": [], "erreur": text[:200]}
+    log(f"  ❌ {url} abandonné après {MAX_ATTEMPTS} essais ({last_err})")
+    return {"statut": last_err, "links": []}
+
+
+# --------------------------------------------------------------------------- #
+# Entrée / checkpoint
+# --------------------------------------------------------------------------- #
+def normalize(url: str) -> tuple[str, str]:
+    """-> (url à mapper, domaine sans www)."""
+    url = url.strip()
+    if "//" not in url:
+        url = "https://" + url
+    u = urlparse(url)
+    host = u.netloc.lower().split(":")[0].removeprefix("www.")
+    target = f"{u.scheme}://{u.netloc}/" if MAP_FROM_ORIGIN else url
+    return target, host
+
+
+def read_input(path: Path) -> list[dict]:
+    if not path.exists():
+        raise SystemExit(f"❌ Fichier d'entrée introuvable : {path.resolve()} "
+                         f"(est-il bien commité dans le dépôt ?)")
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+        log(f"📄 {path} : feuille « {ws.title} » (feuilles : {wb.sheetnames})")
+        it = ws.iter_rows(values_only=True)
+        try:
+            header = [str(h).strip().lower() if h is not None else "" for h in next(it)]
+        except StopIteration:
+            raise SystemExit(f"❌ {path} est vide.")
+        raw = [dict(zip(header, r)) for r in it]
+    else:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rd = csv.DictReader(f)
+            rd.fieldnames = [(h or "").strip().lower() for h in (rd.fieldnames or [])]
+            header = list(rd.fieldnames)
+            raw = list(rd)
+
+    log(f"   Colonnes trouvées : {header}")
+    col = next((c for c in WEBSITE_COLUMNS if c in header), None)
+    if col is None:
+        raise SystemExit(f"❌ Aucune colonne d'URL reconnue parmi {WEBSITE_COLUMNS}. "
+                         f"Colonnes du fichier : {header}")
+    if col != "website":
+        log(f"   ℹ️  Colonne `{col}` utilisée comme URL du site.")
+
+    sites, seen = [], set()
+    empty = dupes = 0
+    for r in raw:
+        w = str(r.get(col) or "").strip()
+        if not w or w.lower() == "none":
+            empty += 1
+            continue
+        target, host = normalize(w)
+        if host in seen:  # un seul appel par domaine
+            dupes += 1
+            continue
+        seen.add(host)
+        sites.append({"domaine": host, "url_source": w, "url_mappee": target,
+                      "title": r.get("title"), "cid": str(r["cid"]) if r.get("cid") else None})
+    log(f"   {len(raw)} ligne(s) lue(s) : {len(sites)} site(s) unique(s), "
+        f"{empty} sans URL, {dupes} doublon(s) de domaine.")
+    if sites:
+        log(f"   Exemple : {sites[0]['url_source']!r} -> {sites[0]['url_mappee']!r}")
+    return sites
+
+
+def load_done() -> tuple[set[str], Counter]:
+    """-> (domaines à ne pas refaire, répartition des statuts déjà enregistrés)."""
+    latest: dict[str, str] = {}
+    if RAW_FILE.exists():
+        with open(RAW_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                latest[rec["domaine"]] = rec.get("statut", "?")
+    final = ("ok",) if RETRY_EMPTY else ("ok", "aucun_resultat")
+    done = {d for d, s in latest.items() if s in final}
+    return done, Counter(latest.values())
+
+
+# --------------------------------------------------------------------------- #
+# Commande : map
+# --------------------------------------------------------------------------- #
+def cmd_map(args) -> int:
+    log("=" * 70)
+    log(f"Config : url={FIRECRAWL_URL} limit={URL_LIMIT} sitemap={SITEMAP} "
+        f"subdomains={INCLUDE_SUBDOMAINS} origin={MAP_FROM_ORIGIN} "
+        f"location={COUNTRY}/{LANGUAGES}")
+    log(f"         timeout={REQUEST_TIMEOUT_S}s essais={MAX_ATTEMPTS} "
+        f"retry_empty={RETRY_EMPTY} verbose={VERBOSE} runtime_max={MAX_RUNTIME_MIN:g} min")
+    pool = KeyPool(load_keys())
+    log(f"{len(pool.keys)} clé(s) API, {args.workers} threads, limite {URL_LIMIT} URLs/site, "
+        f"{RPM_PER_KEY:g} req/min/clé -> ~{RPM_PER_KEY * len(pool.keys):g} sites/min au total.")
+    sites = read_input(Path(args.input))
+    done, prev = load_done()
+    if RAW_FILE.exists():
+        log(f"📦 {RAW_FILE} existe ({RAW_FILE.stat().st_size} octets) ; "
+            f"statuts déjà enregistrés : {dict(prev)}")
+    else:
+        log(f"📦 {RAW_FILE} n'existe pas encore : première exécution.")
+    todo = [s for s in sites if s["domaine"] not in done]
+    if args.limit:
+        todo = todo[: args.limit]
+    log(f"{len(sites)} sites uniques, {len(done)} déjà faits, {len(todo)} à traiter"
+        f"{f' (limite --limit {args.limit})' if args.limit else ''}.")
+    if not todo:
+        if not sites:
+            log("❌ Aucun site à traiter : le fichier d'entrée ne contient aucune URL exploitable.")
+        else:
+            log("ℹ️  Tout est déjà traité (statut ok) dans raw_map.jsonl : rien à faire. "
+                "Pour tout refaire, supprimez output/raw_map.jsonl.")
+        return 0
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    stop = threading.Event()
+    deadline = time.time() + MAX_RUNTIME_MIN * 60
+    counters: Counter = Counter()
+    total_urls = 0
+    t0 = time.time()
+    ICONS = {"ok": "✅", "aucun_resultat": "⚠️ "}
+
+    def work(site: dict):
+        if stop.is_set():
+            return site, None
+        t = time.time()
+        try:
+            res = map_site(pool, site["url_mappee"], stop)
+            res["duree_s"] = round(time.time() - t, 1)
+            return site, res
+        except AllKeysExhausted:
+            stop.set()
+            return site, None
+
+    with open(RAW_FILE, "a", encoding="utf-8") as out, \
+            ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = [ex.submit(work, s) for s in todo]
+        for n, fut in enumerate(as_completed(futures), start=1):
+            site, res = fut.result()
+            if res is None or res["statut"] == "interrompu":
+                continue
+            out.write(json.dumps({**site, **res}, ensure_ascii=False) + "\n")
+            out.flush()
+            counters[res["statut"]] += 1
+            total_urls += len(res["links"])
+            vlog(f"[{n}/{len(todo)}] {ICONS.get(res['statut'], '❌')} {site['domaine']} — "
+                 f"{res['statut']} — {len(res['links'])} URLs — {res.get('duree_s', 0)}s")
+            if n % 50 == 0:
+                log(f"📊 [{n}/{len(todo)}] {dict(counters)} — {total_urls} URLs — "
+                    f"{n / max(time.time() - t0, 1):.2f} sites/s")
+            if time.time() > deadline and not stop.is_set():
+                log("⏱️  Budget de temps atteint : arrêt propre (reprise au prochain run).")
+                stop.set()
+
+    log("=" * 70)
+    log(f"Terminé en {(time.time() - t0) / 60:.1f} min : {dict(counters)} — {total_urls} URLs récupérées")
+    log(f"Usage des clés : {pool.summary()}")
+    if counters.get("aucun_resultat"):
+        log(f"⚠️  {counters['aucun_resultat']} site(s) sans résultat : voir les lignes « HTTP 200 mais 0 lien » "
+            f"ci-dessus ; ils seront retentés au prochain run (RETRY_EMPTY={RETRY_EMPTY}).")
+    if len(pool.dead) == len(pool.keys):
+        log("❌ Toutes les clés sont épuisées : ajouter des clés/crédits puis relancer.")
+    remaining = len(todo) - sum(counters.values())
+    if remaining:
+        log(f"Reste {remaining} site(s) à traiter : relancer le workflow pour continuer.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Commande : build
+# --------------------------------------------------------------------------- #
+def cmd_build(args) -> int:
+    if not RAW_FILE.exists():
+        raise SystemExit(f"❌ {RAW_FILE} introuvable : lancer d'abord « map » "
+                         f"(rien n'a été écrit, voir les logs de l'étape Map).")
+    latest: dict[str, dict] = {}
+    with open(RAW_FILE, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            latest[rec["domaine"]] = rec  # la dernière tentative l'emporte
+    recs = sorted(latest.values(), key=lambda r: r["domaine"])
+    log(f"build : {len(recs)} domaine(s) lus dans {RAW_FILE}")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    url_cols = ["domaine", "title", "cid", "url", "titre_page", "description_page"]
+    n_urls = 0
+    sheet_i, rows_in_sheet = 0, XLSX_ROW_CAP  # force la création de la 1re feuille
+    wb = Workbook(write_only=True)
+    ws = None
+    with open(OUT_DIR / "urls.csv", "w", newline="", encoding="utf-8-sig") as fcsv:
+        w = csv.writer(fcsv)
+        w.writerow(url_cols)
+        for r in recs:
+            for l in r.get("links", []):
+                row = [r["domaine"], r.get("title"), r.get("cid"), l["url"],
+                       l.get("title"), l.get("description")]
+                w.writerow(row)
+                if rows_in_sheet >= XLSX_ROW_CAP:
+                    sheet_i += 1
+                    ws = wb.create_sheet("URLs" if sheet_i == 1 else f"URLs {sheet_i}")
+                    ws.append(url_cols)
+                    rows_in_sheet = 1
+                ws.append(row)
+                rows_in_sheet += 1
+                n_urls += 1
+
+    if ws is None:  # aucune URL : on crée quand même une feuille URLs avec l'en-tête
+        ws = wb.create_sheet("URLs")
+        ws.append(url_cols)
+        log("⚠️  Aucune URL à exporter : urls.xlsx ne contiendra que l'en-tête.")
+
+    ss = wb.create_sheet("Sites")
+    ss.append(["domaine", "title", "cid", "url_mappee", "statut", "nb_urls", "erreur"])
+    stats = Counter()
+    for r in recs:
+        ss.append([r["domaine"], r.get("title"), r.get("cid"), r["url_mappee"],
+                   r["statut"], len(r.get("links", [])), r.get("erreur") or r.get("reponse_brute")])
+        stats[r["statut"]] += 1
+    sy = wb.create_sheet("Synthèse")
+    sy.append(["Indicateur", "Valeur"])
+    sy.append(["Sites traités", len(recs)])
+    for k, v in sorted(stats.items()):
+        sy.append([f"  statut {k}", v])
+    sy.append(["URLs récupérées", n_urls])
+    wb.save(OUT_DIR / "urls.xlsx")
+    log(f"✅ {len(recs)} sites, {n_urls} URLs -> {OUT_DIR / 'urls.csv'} et {OUT_DIR / 'urls.xlsx'}")
+    log(f"   {dict(stats)}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    m = sub.add_parser("map", help="appelle Firecrawl /map (reprend où il s'est arrêté)")
+    m.add_argument("--input", default="data/sites.xlsx")
+    m.add_argument("--limit", type=int, default=0, help="nb max de sites (0 = tous)")
+    m.add_argument("--workers", type=int, default=WORKERS)
+    m.set_defaults(func=cmd_map)
+    b = sub.add_parser("build", help="génère urls.csv / urls.xlsx")
+    b.set_defaults(func=cmd_build)
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
