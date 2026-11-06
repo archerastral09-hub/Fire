@@ -1,0 +1,80 @@
+name: Firecrawl Map (liste des URLs, clés en rotation)
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Nombre max de sites à traiter (0 = tous)"
+        default: "0"
+      workers:
+        description: "Nombre de threads"
+        default: "5"
+      rpm_per_key:
+        description: "Limite /map par clé en req/min (Free=10, Hobby=100, Standard=500)"
+        default: "10"
+      url_limit:
+        description: "URLs max par site"
+        default: "500"
+  # Décommenter pour relancer automatiquement (reprise là où ça s'est arrêté) :
+  # schedule:
+  #   - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firecrawl-map
+  cancel-in-progress: false
+
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # limite GitHub = 360 ; le script s'arrête proprement avant
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Map (reprend automatiquement via output/raw_map.jsonl)
+        env:
+          # Secret : une clé par ligne (ou séparées par des virgules)
+          FIRECRAWL_API_KEYS: ${{ secrets.FIRECRAWL_API_KEYS }}
+          URL_LIMIT: ${{ inputs.url_limit || '500' }}
+          RPM_PER_KEY: ${{ inputs.rpm_per_key || '10' }}
+          MAX_RUNTIME_MIN: "335"
+        run: >
+          python map_sites.py map
+          --input data/sites.xlsx
+          --limit "${{ inputs.limit || 0 }}"
+          --workers "${{ inputs.workers || 5 }}"
+
+      - name: Export urls.csv / urls.xlsx
+        if: always()
+        run: python map_sites.py build
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: urls-sites
+          path: output/
+          retention-days: 30
+
+      - name: Commit des résultats (progression sauvegardée même en cas d'échec)
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          if git diff --cached --quiet; then
+            echo "Rien à committer."
+          else
+            git commit -m "chore: URLs Firecrawl map ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git pull --rebase --autostash || true
+            git push
+          fi
